@@ -1,0 +1,16 @@
+[package]
+name = "procwatch"
+version = "0.1.0"
+edition = "2024"
+description = "Watch a single macOS process in a Catppuccin Frappe terminal UI"
+
+[dependencies]
+libc = "0.2.191"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
