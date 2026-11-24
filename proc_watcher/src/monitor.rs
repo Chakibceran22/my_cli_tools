@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::platform::{self, TaskInfo};
+use crate::platform::{self, CoreTicks, TaskInfo};
 use crate::render::sanitize;
 
 /// Samples kept per series; more than any chart is wide.
@@ -43,7 +43,7 @@ impl History {
         (&self.points[start..], &self.spikes[start..])
     }
 
-    fn last(&self) -> Option<u64> {
+    pub fn last(&self) -> Option<u64> {
         self.points.last().copied()
     }
 
@@ -54,6 +54,53 @@ impl History {
     pub fn average(&self) -> u64 {
         if self.count == 0 { 0 } else { (self.sum / u128::from(self.count)) as u64 }
     }
+}
+
+/// Machine-wide CPU: each logical core, all of them together, and the load
+/// average. macOS does not say which core a process's threads run on, so this
+/// sits beside the process's own figures and is never split by process.
+#[derive(Default)]
+pub struct Machine {
+    /// Busy percent of each logical core, in tenths, C0 first.
+    pub cores: Vec<History>,
+    /// Busy percent of all cores together at the last sample, in tenths.
+    pub total: u64,
+    pub load_average: Option<[f64; 3]>,
+    previous: Vec<CoreTicks>,
+}
+
+impl Machine {
+    /// Reads every core's ticks; the first call only sets the baseline.
+    pub fn sample(&mut self) {
+        let Some(now) = platform::core_ticks() else { return };
+        if self.cores.len() != now.len() {
+            self.cores = now.iter().map(|_| History::default()).collect();
+        }
+        if self.previous.len() == now.len() {
+            let (mut busy, mut all) = (0, 0);
+            for ((history, &before), &after) in self.cores.iter_mut().zip(&self.previous).zip(&now) {
+                let (core_busy, core_all) = ticks_since(before, after);
+                history.push(tenths(core_busy, core_all), false);
+                busy += core_busy;
+                all += core_all;
+            }
+            self.total = tenths(busy, all);
+        }
+        self.previous = now;
+        self.load_average = platform::load_average();
+    }
+}
+
+/// Busy and total ticks one core spent between two readings.
+fn ticks_since(before: CoreTicks, after: CoreTicks) -> (u64, u64) {
+    let busy = u64::from(after.busy.wrapping_sub(before.busy));
+    let idle = u64::from(after.idle.wrapping_sub(before.idle));
+    (busy, busy + idle)
+}
+
+/// `part` of `whole` in tenths of a percent, rounded.
+fn tenths(part: u64, whole: u64) -> u64 {
+    if whole == 0 { 0 } else { (part * 1000 + whole / 2) / whole }
 }
 
 /// CPU (in tenths of a percent) rose at least 20 points, and by half, since the previous sample.
@@ -142,6 +189,7 @@ pub struct Monitor {
     /// Things worth logging since the last call to `take_notes`.
     notes: Vec<String>,
     pub cores: usize,
+    pub machine: Machine,
     pub total_memory: u64,
     pub snapshot: Option<Snapshot>,
     /// CPU percent in tenths, so the chart keeps one decimal of precision.
@@ -159,9 +207,15 @@ impl Monitor {
     pub fn new(root: u32, focus: Focus) -> Result<Self, String> {
         let mut sys = System::new().map_err(|err| format!("cannot read system info: {err}"))?;
         sys.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+        let mut machine = Machine::default();
+        machine.sample();
         Ok(Self {
             total_memory: sys.total_memory(),
-            cores: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            cores: match machine.cores.len() {
+                0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+                n => n,
+            },
+            machine,
             sys,
             root: Pid::from_u32(root),
             root_start: None,
@@ -403,6 +457,17 @@ mod tests {
         // 100% -> 140% is +40 points but not +50%.
         assert!(!is_cpu_spike(Some(1000), 1400));
         assert!(is_cpu_spike(Some(1000), 1500));
+    }
+
+    #[test]
+    fn core_load_from_ticks() {
+        let at = |busy, idle| CoreTicks { busy, idle };
+        assert_eq!(ticks_since(at(100, 900), at(130, 970)), (30, 100));
+        // The kernel's 32-bit counters wrap.
+        assert_eq!(ticks_since(at(u32::MAX - 4, 0), at(5, 10)), (10, 20));
+        assert_eq!(tenths(30, 100), 300);
+        assert_eq!(tenths(1, 3), 333);
+        assert_eq!(tenths(0, 0), 0);
     }
 
     #[test]

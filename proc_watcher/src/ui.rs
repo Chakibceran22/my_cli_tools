@@ -19,9 +19,11 @@ const LABEL_WIDTH: usize = 12;
 const MIB: f64 = 1024.0 * 1024.0;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Tall enough for the CPU panel's core grid: totals, a heading, the grid and stats.
+    let charts_height = (core_rows(app.monitor.machine.cores.len()) as u16 + 6).max(11);
     let [header, charts, body, footer] = Layout::vertical([
         Constraint::Length(4),
-        Constraint::Length(11),
+        Constraint::Length(charts_height),
         Constraint::Min(8),
         Constraint::Length(1),
     ])
@@ -90,29 +92,174 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![summary, command]).block(block), area);
 }
 
+/// The process's own CPU, the machine's, then every core of the machine.
 fn draw_cpu(frame: &mut Frame, app: &App, area: Rect) {
-    let cpu = app.monitor.snapshot.as_ref().map_or(0.0, |s| f64::from(s.cpu));
-    let share = (cpu / (100.0 * app.monitor.cores as f64)).clamp(0.0, 1.0);
-    let history = &app.monitor.cpu;
+    let monitor = &app.monitor;
+    let machine = &monitor.machine;
+    let snapshot = monitor.snapshot.as_ref();
+    let cpu = snapshot.map_or(0.0, |s| f64::from(s.cpu));
+    let spike = snapshot.is_some_and(|s| s.cpu_spike);
 
     let block = panel("CPU", CPU).title(Line::from(format!(" {cpu:.1}% ").fg(CPU).bold()).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Zero-based, with a quarter of headroom and never below 10%, so idle noise stays flat.
-    let bounds = |_low: f64, high: f64| [0.0, (high * 1.25).max(100.0)];
-    let percent = |tenths: f64| format!("{:.0}%", tenths / 10.0);
-    let gauge = format!("{:>5.1}% of {} cores", share * 100.0, app.monitor.cores);
-    let stats = |range: [f64; 2]| {
-        format!(
-            "avg {:.1}%  peak {:.1}%  chart {}-{}",
-            history.average() as f64 / 10.0,
-            history.peak() as f64 / 10.0,
-            percent(range[0]),
-            percent(range[1]),
-        )
+    let [process_row, machine_row, heading, grid, stats] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // The process, in percent of one core like Activity Monitor, so it can pass
+    // 100%. Charted against one full core, or its own peak when higher.
+    const LABEL: usize = 8;
+    const VALUE: usize = 8;
+    let history = &monitor.cpu;
+    let width = (process_row.width as usize).saturating_sub(LABEL + VALUE);
+    let (points, spikes) = history.tail(width * 2);
+    let full = points.iter().copied().max().unwrap_or(0).max(1000) as f64;
+    let value_style = if spike { Style::new().fg(RED).bold() } else { Style::new().fg(CPU).bold() };
+    let mut spans = vec![format!("{:<LABEL$}", "process").fg(SUBTEXT0)];
+    spans.extend(sparkline(points, spikes, full, width, |_, spike| if spike { RED } else { CPU }));
+    spans.push(Span::styled(format!("{cpu:>VALUE$.1}%", VALUE = VALUE - 1), value_style));
+    frame.render_widget(Paragraph::new(Line::from(spans)), process_row);
+
+    // The whole machine, 0-100% across all cores.
+    let total = machine.total as f64 / 10.0;
+    let mut spans = vec![format!("{:<LABEL$}", "machine").fg(SUBTEXT0)];
+    spans.extend(bar(total / 100.0, width));
+    spans.push(format!("{total:>VALUE$.1}%", VALUE = VALUE - 1).fg(load(total / 100.0)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), machine_row);
+
+    if !machine.cores.is_empty() {
+        let title = format!("{} cores, whole machine ", machine.cores.len());
+        let rule = "\u{2500}".repeat((heading.width as usize).saturating_sub(title.chars().count()));
+        frame.render_widget(Paragraph::new(Line::from(vec![title.fg(OVERLAY0), rule.fg(SURFACE0)])), heading);
+        draw_cores(frame, &machine.cores, grid);
+    }
+
+    let mut text = format!(
+        "avg {:.1}%  peak {:.1}%",
+        history.average() as f64 / 10.0,
+        history.peak() as f64 / 10.0,
+    );
+    if let Some([one, five, fifteen]) = machine.load_average {
+        text.push_str(&format!("  load {one:.2} {five:.2} {fifteen:.2}"));
+    }
+    frame.render_widget(Paragraph::new(text.fg(OVERLAY1)), stats);
+}
+
+/// Rows of the core grid when it has room: two columns up to 16 cores, then
+/// as many columns as keep it at eight rows.
+fn core_rows(cores: usize) -> usize {
+    cores.div_ceil(cores.div_ceil(8).max(2))
+}
+
+/// Every core as `C3  <history>  42%`, numbered down each column, columns split by a rule.
+fn draw_cores(frame: &mut Frame, cores: &[History], area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let columns = cores.len().div_ceil(area.height as usize).max(2).min(cores.len());
+    let rows = cores.len().div_ceil(columns);
+    let area = Rect { height: area.height.min(rows as u16), ..area };
+    let label_width = format!("C{}", cores.len() - 1).len();
+
+    let rects = Layout::horizontal(vec![Constraint::Fill(1); columns]).spacing(3).split(area);
+    for (column, rect) in rects.iter().enumerate() {
+        if column > 0 {
+            let rule = Rect { x: rect.x.saturating_sub(2), width: 1, ..*rect };
+            let lines = vec![Line::from("\u{2502}".fg(SURFACE1)); rule.height as usize];
+            frame.render_widget(Paragraph::new(lines), rule);
+        }
+        let lines: Vec<Line> = cores
+            .iter()
+            .enumerate()
+            .skip(column * rows)
+            .take(rows)
+            .map(|(index, history)| core_line(index, history, label_width, rect.width as usize))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), *rect);
+    }
+}
+
+fn core_line(index: usize, history: &History, label_width: usize, width: usize) -> Line<'static> {
+    const VALUE: usize = 5;
+    let tenths = history.last().unwrap_or(0);
+    let ratio = tenths as f64 / 1000.0;
+    // Under 1% reads as idle: dim, so the busy cores stand out.
+    let value_color = if tenths < 10 { OVERLAY0 } else { load(ratio) };
+    let spark_width = width.saturating_sub(label_width + 1 + VALUE);
+    let (points, _) = history.tail(spark_width * 2);
+
+    let mut spans = vec![format!("{:<label_width$} ", format!("C{index}")).fg(OVERLAY1)];
+    spans.extend(sparkline(points, &[], 1000.0, spark_width, |ratio, _| load(ratio)));
+    spans.push(format!("{:>4.0}%", tenths as f64 / 10.0).fg(value_color));
+    Line::from(spans)
+}
+
+/// One row of braille, two samples per cell, newest on the right. Each sample
+/// keeps its bottom dot, so a quiet stretch reads as a dotted baseline, and
+/// gains up to three more as `value / full` rises. A cell takes
+/// `color(ratio, spike)` of its busier sample; cells under 5% are dimmed.
+fn sparkline(
+    points: &[u64],
+    spikes: &[bool],
+    full: f64,
+    width: usize,
+    color: impl Fn(f64, bool) -> Color,
+) -> Vec<Span<'static>> {
+    let slots = width * 2;
+    let start = points.len().saturating_sub(slots);
+    let pad = slots - (points.len() - start);
+    let sample = |slot: usize| -> (f64, bool) {
+        match slot.checked_sub(pad) {
+            Some(i) => ((points[start + i] as f64 / full).clamp(0.0, 1.0), spikes.get(start + i) == Some(&true)),
+            None => (0.0, false),
+        }
     };
-    draw_series(frame, inner, history, bounds, CPU, (share, gauge), stats);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_color = None;
+    for cell in 0..width {
+        let (left, left_spike) = sample(cell * 2);
+        let (right, right_spike) = sample(cell * 2 + 1);
+        let (ratio, spike) = (left.max(right), left_spike || right_spike);
+        let cell_color = if ratio < 0.05 && !spike { SURFACE1 } else { color(ratio, spike) };
+        if run_color.is_some_and(|c| c != cell_color) {
+            spans.push(std::mem::take(&mut run).fg(run_color.unwrap_or(SURFACE1)));
+        }
+        run_color = Some(cell_color);
+        run.push(braille(dots(left), dots(right)));
+    }
+    if let Some(c) = run_color {
+        spans.push(run.fg(c));
+    }
+    spans
+}
+
+/// Dots in one braille column for a ratio: 1 (the baseline) to 4.
+fn dots(ratio: f64) -> usize {
+    1 + (ratio * 3.0).round().clamp(0.0, 3.0) as usize
+}
+
+/// A braille cell with `left` and `right` columns filled from the bottom.
+fn braille(left: usize, right: usize) -> char {
+    const LEFT: [u32; 4] = [0x40, 0x04, 0x02, 0x01];
+    const RIGHT: [u32; 4] = [0x80, 0x20, 0x10, 0x08];
+    let bits: u32 = LEFT[..left.min(4)].iter().chain(&RIGHT[..right.min(4)]).sum();
+    char::from_u32(0x2800 + bits).unwrap_or(' ')
+}
+
+/// A `width`-cell bar filled to `ratio`, green, yellow or red with the load.
+fn bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    vec!["\u{2501}".repeat(filled).fg(load(ratio)), "\u{2501}".repeat(width - filled).fg(SURFACE0)]
 }
 
 fn draw_memory(frame: &mut Frame, app: &App, area: Rect) {
@@ -564,6 +711,41 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
             .collect()
+    }
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn braille_columns_fill_from_the_bottom() {
+        assert_eq!(braille(1, 1), '\u{28c0}');
+        assert_eq!(braille(4, 4), '\u{28ff}');
+        assert_eq!(braille(4, 1), '\u{28c7}');
+        assert_eq!((dots(0.0), dots(0.1), dots(0.5), dots(1.0), dots(7.0)), (1, 1, 3, 4, 4));
+    }
+
+    #[test]
+    fn sparklines_put_the_newest_on_the_right() {
+        let spans = sparkline(&[1000, 1000, 0, 0], &[], 1000.0, 3, |_, _| GREEN);
+        // Padding, then (100%, 100%), then (0%, 0%).
+        assert_eq!(text(&spans), "\u{28c0}\u{28ff}\u{28c0}");
+        assert_eq!(spans.iter().map(|s| s.style.fg).collect::<Vec<_>>(), [Some(SURFACE1), Some(GREEN), Some(SURFACE1)]);
+        // Only the last `width * 2` points are drawn.
+        assert_eq!(text(&sparkline(&[1000; 10], &[], 1000.0, 2, |_, _| GREEN)), "\u{28ff}\u{28ff}");
+        assert!(sparkline(&[500], &[], 1000.0, 0, |_, _| GREEN).is_empty());
+        let spiked = sparkline(&[0, 10], &[false, true], 1000.0, 1, |_, spike| if spike { RED } else { GREEN });
+        assert_eq!(spiked[0].style.fg, Some(RED));
+    }
+
+    #[test]
+    fn core_grid_keeps_to_eight_rows() {
+        assert_eq!(core_rows(8), 4);
+        assert_eq!(core_rows(15), 8);
+        assert_eq!(core_rows(16), 8);
+        assert_eq!(core_rows(24), 8);
+        assert_eq!(core_rows(32), 8);
+        assert_eq!(core_rows(1), 1);
     }
 
     #[test]

@@ -166,6 +166,9 @@ impl App {
         }
         let threads_before = self.threads();
         let generation = self.monitor.generation;
+        // Only here, on the interval: a sample taken right after a focus change
+        // would cover a few milliseconds, too few ticks to mean anything.
+        self.monitor.machine.sample();
         let sampled = self.monitor.sample();
         for note in self.monitor.take_notes() {
             self.event(note);

@@ -7,6 +7,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::OnceLock;
 
 /// Cumulative scheduler counters for a task. Counts are kernel `int`s that may wrap.
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +58,66 @@ impl TaskInfo {
             pageins: self.pageins.wrapping_add(other.pageins),
         }
     }
+}
+
+/// Scheduler ticks one logical core has spent busy (user, system, nice) and
+/// idle since boot. The kernel counts them in 32 bits, so they wrap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreTicks {
+    pub busy: u32,
+    pub idle: u32,
+}
+
+/// Every logical core's ticks, in the kernel's order (C0 first). This is the
+/// whole machine: macOS does not say which core a given process ran on.
+#[allow(deprecated)] // libc points to the mach2 crate for these; the Mach calls themselves are stable.
+pub fn core_ticks() -> Option<Vec<CoreTicks>> {
+    // Each mach_host_self call adds a reference to the port, so take it once.
+    static HOST: OnceLock<libc::host_t> = OnceLock::new();
+    // SAFETY: mach_host_self has no preconditions.
+    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+
+    let mut cores: libc::natural_t = 0;
+    let mut info: libc::processor_info_array_t = std::ptr::null_mut();
+    let mut len: libc::mach_msg_type_number_t = 0;
+    // SAFETY: the out-pointers refer to live locals. On success the kernel maps
+    // `len` integers at `info`, unmapped below.
+    let rc = unsafe {
+        libc::host_processor_info(host, libc::PROCESSOR_CPU_LOAD_INFO, &mut cores, &mut info, &mut len)
+    };
+    if rc != libc::KERN_SUCCESS || info.is_null() {
+        return None;
+    }
+    // SAFETY: `info` holds `len` integers until the vm_deallocate below.
+    let states = unsafe { std::slice::from_raw_parts(info, len as usize) };
+    let tick = |core: &[libc::integer_t], state: libc::c_int| core[state as usize] as u32;
+    let ticks = states
+        .chunks_exact(libc::CPU_STATE_MAX as usize)
+        .take(cores as usize)
+        .map(|core| CoreTicks {
+            busy: tick(core, libc::CPU_STATE_USER)
+                .wrapping_add(tick(core, libc::CPU_STATE_SYSTEM))
+                .wrapping_add(tick(core, libc::CPU_STATE_NICE)),
+            idle: tick(core, libc::CPU_STATE_IDLE),
+        })
+        .collect();
+    // SAFETY: unmaps exactly the region host_processor_info mapped, once.
+    unsafe {
+        libc::vm_deallocate(
+            libc::mach_task_self(),
+            info as libc::vm_address_t,
+            len as libc::vm_size_t * size_of::<libc::integer_t>(),
+        );
+    }
+    Some(ticks)
+}
+
+/// The 1, 5 and 15 minute load averages.
+pub fn load_average() -> Option<[f64; 3]> {
+    let mut load = [0.0; 3];
+    // SAFETY: the buffer holds the three values asked for.
+    let filled = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+    (filled == 3).then_some(load)
 }
 
 /// Direct children of `pid`.
@@ -191,5 +252,14 @@ mod tests {
         assert!(tree.contains(&(child.id(), 1)));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn reads_every_core() {
+        let cores = std::thread::available_parallelism().unwrap().get();
+        let ticks = core_ticks().unwrap();
+        assert_eq!(ticks.len(), cores);
+        assert!(ticks.iter().all(|t| t.busy > 0 || t.idle > 0));
+        assert!(load_average().is_some());
     }
 }

@@ -36,9 +36,12 @@ the Activity log records each restart. Choosing another process starts the chart
 
 ## What it shows
 
-- **CPU and Memory**: braille line charts with spikes marked in red, a share-of-machine gauge,
-  average, peak and the chart's range. The memory chart zooms to the recent range, so small
-  changes are visible instead of a solid block.
+- **CPU**: the process's own CPU as a one-line braille history (spikes in red), the whole
+  machine's load as a bar, then every core of the machine (`C0`, `C1`, ...) with its own history
+  and percentage, so you can see which cores are busy. Average, peak and the load average below.
+- **Memory**: a braille line chart with spikes marked in red, a share-of-machine gauge, average,
+  peak and the chart's range. It zooms to the recent range, so small changes are visible instead
+  of a solid block.
 - **Details**: parent, user, status, start time, threads, priority, open files, where stdout and
   stderr go, disk I/O, context switches and syscalls per second, faults, paths.
 - **Activity**: one line per sample (CPU, memory, memory change). CPU spikes (up 20 points and
@@ -99,6 +102,10 @@ The Details panel says where stdout and stderr go, and which `pw run` is capture
 ## Notes
 
 - CPU is per core, like Activity Monitor: 250% means two and a half cores busy.
+- The per-core rows are the whole machine. macOS does not tell another program which core a
+  process ran on (that needs root and kernel tracing), and the scheduler moves threads between
+  cores many times a second anyway: one thread at 100% shows up as about 20% on each of four or
+  five cores. Compare the busy cores with the process's own figure to judge how much is yours.
 - If the PID exits, or is reused by a new process, the badge turns to `exited` and the last
   values stay on screen.
 - macOS only: threads, priority, context switches, syscalls, faults and stream detection use `libproc`.
